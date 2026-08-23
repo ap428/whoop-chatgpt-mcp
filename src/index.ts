@@ -4,31 +4,95 @@ import { z } from "zod";
 
 interface Env {
   WHOOP_TOKENS: KVNamespace;
+  WHOOP_CLIENT_ID: string;
+  WHOOP_CLIENT_SECRET: string;
 }
 
-async function getAccessToken(env: Env): Promise<string> {
+interface WhoopTokens {
+  access_token: string;
+  refresh_token?: string;
+  expires_in?: number;
+  scope?: string;
+  token_type?: string;
+  [key: string]: unknown;
+}
+
+async function getTokens(env: Env): Promise<WhoopTokens> {
   const raw = await env.WHOOP_TOKENS.get("whoop_tokens");
 
   if (!raw) {
     throw new Error("WHOOP tokens not found in KV");
   }
 
-  const tokens = JSON.parse(raw);
+  const tokens = JSON.parse(raw) as WhoopTokens;
 
   if (!tokens.access_token) {
-    throw new Error("WHOOP access_token not found");
+    throw new Error("WHOOP access_token not found in KV");
   }
 
-  return tokens.access_token;
+  return tokens;
 }
 
-async function whoopGet(
-  env: Env,
-  path: string
-): Promise<any> {
-  const accessToken = await getAccessToken(env);
+async function refreshAccessToken(env: Env): Promise<WhoopTokens> {
+  const oldTokens = await getTokens(env);
+
+  if (!oldTokens.refresh_token) {
+    throw new Error(
+      "WHOOP refresh_token not found in KV. Reauthorization with offline scope is required."
+    );
+  }
+
+  const body = new URLSearchParams({
+    grant_type: "refresh_token",
+    refresh_token: oldTokens.refresh_token,
+    client_id: env.WHOOP_CLIENT_ID,
+    client_secret: env.WHOOP_CLIENT_SECRET,
+    scope: "offline",
+  });
 
   const response = await fetch(
+    "https://api.prod.whoop.com/oauth/oauth2/token",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Accept: "application/json",
+      },
+      body,
+    }
+  );
+
+  const responseText = await response.text();
+
+  if (!response.ok) {
+    throw new Error(
+      `WHOOP token refresh failed ${response.status}: ${responseText}`
+    );
+  }
+
+  const newTokens = JSON.parse(responseText) as WhoopTokens;
+
+  if (!newTokens.access_token) {
+    throw new Error("WHOOP refresh response has no access_token");
+  }
+
+  if (!newTokens.refresh_token) {
+    throw new Error("WHOOP refresh response has no refresh_token");
+  }
+
+  await env.WHOOP_TOKENS.put(
+    "whoop_tokens",
+    JSON.stringify(newTokens)
+  );
+
+  return newTokens;
+}
+
+async function makeWhoopRequest(
+  path: string,
+  accessToken: string
+): Promise<Response> {
+  return fetch(
     `https://api.prod.whoop.com/developer${path}`,
     {
       headers: {
@@ -37,9 +101,33 @@ async function whoopGet(
       },
     }
   );
+}
+
+async function whoopGet(
+  env: Env,
+  path: string
+): Promise<any> {
+  let tokens = await getTokens(env);
+
+  let response = await makeWhoopRequest(
+    path,
+    tokens.access_token
+  );
+
+  // Access token expired or invalid:
+  // refresh it once and retry the original request.
+  if (response.status === 401) {
+    tokens = await refreshAccessToken(env);
+
+    response = await makeWhoopRequest(
+      path,
+      tokens.access_token
+    );
+  }
 
   if (!response.ok) {
     const body = await response.text();
+
     throw new Error(
       `WHOOP API error ${response.status}: ${body}`
     );
@@ -51,7 +139,7 @@ async function whoopGet(
 function createServer(env: Env) {
   const server = new McpServer({
     name: "WHOOP",
-    version: "1.0.0",
+    version: "1.1.0",
   });
 
   server.registerTool(
@@ -180,9 +268,12 @@ export default {
     }
 
     if (url.pathname === "/mcp") {
-  const handler = createMcpHandler(() => createServer(env));
-  return handler(request, env, ctx);
-}
+      const handler = createMcpHandler(
+        () => createServer(env)
+      );
+
+      return handler(request, env, ctx);
+    }
 
     return new Response("Not found", {
       status: 404,
